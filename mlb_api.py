@@ -106,32 +106,6 @@ def extract_events(feed_json: dict) -> list[dict]:
                 "hit_distance": (hit_data or {}).get("totalDistance"),
             })
  
-        # --- Replay review detection ---
-        review = play.get("reviewDetails") or {}
-        if review:
-            in_progress = review.get("inProgress")
-            review_type = review.get("reviewType", "Play")
- 
-            if in_progress:
-                events.append({
-                    "type": "review_pending",
-                    "play_id": play_id,
-                    "inning": inning,
-                    "half": half,
-                    "description": description,
-                    "review_type": review_type,
-                })
-            elif review.get("isOverturned") is not None:
-                events.append({
-                    "type": "review_result",
-                    "play_id": play_id,
-                    "inning": inning,
-                    "half": half,
-                    "description": description,
-                    "overturned": review.get("isOverturned"),
-                    "review_type": review_type,
-                })
- 
     return events
  
  
