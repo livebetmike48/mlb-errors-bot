@@ -28,6 +28,13 @@ def init_db():
             )
         """)
         c.execute("""
+            CREATE TABLE IF NOT EXISTS alerted_descriptions (
+                game_pk INTEGER,
+                description_hash TEXT,
+                PRIMARY KEY (game_pk, description_hash)
+            )
+        """)
+        c.execute("""
             CREATE TABLE IF NOT EXISTS config (
                 key TEXT PRIMARY KEY,
                 value TEXT
@@ -62,6 +69,34 @@ def mark_alerted(game_pk: int, play_id, event_type: str):
         c.execute(
             "INSERT OR IGNORE INTO alerted_events (game_pk, play_id, event_type) VALUES (?,?,?)",
             (game_pk, play_id, event_type),
+        )
+
+
+def _hash_description(description: str) -> str:
+    import hashlib
+    return hashlib.sha256(description.strip().lower().encode()).hexdigest()
+
+
+def already_alerted_by_content(game_pk: int, description: str) -> bool:
+    """
+    Secondary dedup layer, independent of play_id. MLB's live feed can
+    occasionally re-issue the same real-world play under a new atBatIndex
+    (e.g. after an internal correction/reprocess) -- this catches that case
+    even though the play_id-based check alone wouldn't.
+    """
+    with _conn() as c:
+        row = c.execute(
+            "SELECT 1 FROM alerted_descriptions WHERE game_pk = ? AND description_hash = ?",
+            (game_pk, _hash_description(description)),
+        ).fetchone()
+        return row is not None
+
+
+def mark_alerted_by_content(game_pk: int, description: str):
+    with _conn() as c:
+        c.execute(
+            "INSERT OR IGNORE INTO alerted_descriptions (game_pk, description_hash) VALUES (?, ?)",
+            (game_pk, _hash_description(description)),
         )
 
 
