@@ -128,8 +128,11 @@ async def poll_games():
         for event in events:
             if storage.already_alerted(game["game_pk"], event["play_id"], event["type"]):
                 continue
+            if storage.already_alerted_by_content(game["game_pk"], event["description"]):
+                continue
 
             storage.mark_alerted(game["game_pk"], event["play_id"], event["type"])
+            storage.mark_alerted_by_content(game["game_pk"], event["description"])
             try:
                 sent_message = await channel.send(embed=build_embed(game, event))
                 log.info("Alerted %s in game %s", event["type"], game["game_pk"])
