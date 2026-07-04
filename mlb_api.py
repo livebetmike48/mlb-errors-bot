@@ -70,6 +70,31 @@ def extract_events(feed_json: dict) -> list[dict]:
         batter_name = (matchup.get("batter") or {}).get("fullName")
         run_scored = bool(about.get("isScoringPlay")) or (result.get("rbi") or 0) > 0
 
+        # --- Official Scorer ruling pending ---
+        # MLB literally includes the phrase "Official Scorer ruling pending"
+        # in the play description while a hit-vs-error call is undecided.
+        if "ruling pending" in description.lower():
+            hit_data = None
+            for pe in reversed(play.get("playEvents", []) or []):
+                hd = pe.get("hitData")
+                if hd:
+                    hit_data = hd
+                    break
+
+            events.append({
+                "type": "ruling_pending",
+                "play_id": play_id,
+                "inning": inning,
+                "half": half,
+                "description": description,
+                "end_time": about.get("endTime"),
+                "batter": batter_name,
+                "run_scored": run_scored,
+                "exit_velocity": (hit_data or {}).get("launchSpeed"),
+                "launch_angle": (hit_data or {}).get("launchAngle"),
+                "hit_distance": (hit_data or {}).get("totalDistance"),
+            })
+
         # --- Error detection ---
         # Skip plays whose PRIMARY event is a stolen base attempt or a
         # strikeout (dropped third strike) -- these can mention "error" in
