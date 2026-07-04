@@ -49,12 +49,19 @@ def team_abbr(name: str) -> str:
 
 
 def build_embed(game: dict, event: dict) -> discord.Embed:
-    title = f"⚠️ Error"
-    if event.get("fielder_name"):
-        pos = f"{event['fielder_position']} " if event.get("fielder_position") else ""
-        title = f"⚠️ Error — {pos}{event['fielder_name']}"
+    if event["type"] == "ruling_pending":
+        title = "📋 Scorer ruling pending"
+        if event.get("batter"):
+            title += f" — {event['batter']}"
+        color = discord.Color.light_grey()
+    else:
+        title = "⚠️ Error"
+        if event.get("fielder_name"):
+            pos = f"{event['fielder_position']} " if event.get("fielder_position") else ""
+            title = f"⚠️ Error — {pos}{event['fielder_name']}"
+        color = discord.Color.gold()
 
-    embed = discord.Embed(title=title[:256], color=discord.Color.gold())
+    embed = discord.Embed(title=title[:256], color=color)
     embed.add_field(name="Description", value=f"```{event['description'][:1000]}```", inline=False)
     embed.add_field(
         name="Game",
@@ -146,7 +153,12 @@ async def poll_video_followups():
 
         try:
             content = mlb_api.get_game_content(row["game_pk"])
+            items_count = len((((content.get("highlights") or {}).get("live") or {}).get("items")) or [])
             match = mlb_api.find_highlight_for_play(content, row["description"], row["play_end_time"])
+            log.info(
+                "Video lookup game %s play %s: %d highlight items available, match=%s",
+                row["game_pk"], row["play_id"], items_count, bool(match),
+            )
         except Exception as e:
             log.error("Video lookup failed for game %s: %s", row["game_pk"], e)
             storage.increment_video_attempts(row["id"])
@@ -185,7 +197,12 @@ async def before_poll():
 
 @bot.event
 async def on_ready():
-    storage.init_db()
+    try:
+        storage.init_db()
+    except Exception as e:
+        log.error("Failed to init database at %s: %s -- falling back to local storage", storage.DB_PATH, e)
+        storage.DB_PATH = "errors_bot_fallback.db"
+        storage.init_db()
     try:
         synced = await bot.tree.sync()
         log.info("Synced %d slash commands", len(synced))
