@@ -162,6 +162,18 @@ async def poll_video_followups():
                 "Video lookup game %s play %s: %d highlight items available, match=%s",
                 row["game_pk"], row["play_id"], items_count, bool(match),
             )
+            if items_count == 0 and row["attempts"] == 0:
+                # Diagnostic only, fires once per play on the first attempt --
+                # this tells us the REAL shape of the response instead of
+                # continuing to guess at the JSON path. Once we see this in
+                # the logs we can fix the parsing with certainty.
+                top_keys = list(content.keys())
+                highlights_val = content.get("highlights")
+                log.info(
+                    "DIAGNOSTIC game %s: top-level content keys=%s | 'highlights' key type=%s value_preview=%s",
+                    row["game_pk"], top_keys, type(highlights_val).__name__,
+                    str(highlights_val)[:500] if highlights_val else "None/empty",
+                )
         except Exception as e:
             log.error("Video lookup failed for game %s: %s", row["game_pk"], e)
             storage.increment_video_attempts(row["id"])
