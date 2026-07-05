@@ -148,10 +148,41 @@ async def poll_games():
                 log.error("Failed to send alert for game %s: %s", game["game_pk"], e)
 
 
+async def _give_up_on_video(row: dict):
+    """Instead of silently doing nothing when no clip is ever found, post
+    an honest note -- e.g. if it's a national broadcast, MLB.tv is dark for
+    that game and clips through this pipeline generally aren't available,
+    same distinction a similar bot in the community already makes."""
+    channel = bot.get_channel(row["channel_id"])
+    if channel is None:
+        return
+    try:
+        message = await channel.fetch_message(row["message_id"])
+    except Exception as e:
+        log.error("Couldn't fetch message %s to add no-clip note: %s", row["message_id"], e)
+        return
+
+    try:
+        is_national = await asyncio.to_thread(mlb_api.is_national_broadcast, row["game_pk"])
+    except Exception as e:
+        log.error("Failed to check national broadcast status for game %s: %s", row["game_pk"], e)
+        is_national = False
+
+    note = (
+        "*(no clip — national TV exclusive; dark for MLB.tv)*" if is_national
+        else "*(no clip found for this play)*"
+    )
+    try:
+        await channel.send(note, reference=message)
+    except Exception as e:
+        log.error("Failed to send no-clip note for game %s: %s", row["game_pk"], e)
+
+
 @tasks.loop(seconds=VIDEO_POLL_SECONDS)
 async def poll_video_followups():
     for row in storage.get_pending_video_lookups():
         if row["attempts"] >= VIDEO_MAX_ATTEMPTS:
+            await _give_up_on_video(row)
             storage.delete_pending_video_lookup(row["id"])
             continue
 
