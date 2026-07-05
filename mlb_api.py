@@ -164,7 +164,7 @@ def find_highlight_for_play(content_json: dict, play_description: str, play_end_
     missing, send me a game_pk while a real error highlight is up and I can
     tune the matching logic against real content-endpoint data.
     """
-    items = ((content_json.get("highlights") or {}).get("live") or {}).get("items") or []
+    items = ((content_json.get("highlights") or {}).get("highlights") or {}).get("items") or []
     if not items:
         return None
 
