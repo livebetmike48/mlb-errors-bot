@@ -8,6 +8,31 @@ BASE = "https://statsapi.mlb.com/api/v1"
 BASE_V1_1 = "https://statsapi.mlb.com/api/v1.1"
 
 
+def is_national_broadcast(game_pk: int) -> bool:
+    """
+    Checks if a game has a national broadcast (ESPN/FOX/Apple/Peacock etc).
+    National broadcasts are typically blacked out on MLB.tv and don't get
+    highlight clips through the usual content pipeline -- this lets us
+    give an honest "no clip, here's why" note instead of silently failing.
+    """
+    try:
+        resp = requests.get(
+            f"{BASE}/schedule",
+            params={"sportId": 1, "gamePk": game_pk, "hydrate": "broadcasts"},
+            timeout=15,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        for date_entry in data.get("dates", []):
+            for g in date_entry.get("games", []):
+                if g.get("gamePk") == game_pk:
+                    broadcasts = g.get("broadcasts", [])
+                    return any(b.get("isNational") for b in broadcasts)
+    except Exception:
+        pass
+    return False
+
+
 def get_live_games(date_str: str) -> list[dict]:
     """Lightweight schedule call to find which games are currently Live."""
     resp = requests.get(
