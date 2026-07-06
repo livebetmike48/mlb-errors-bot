@@ -10,7 +10,6 @@ from dotenv import load_dotenv
 
 import mlb_api
 import storage
-import savant_video
 
 load_dotenv()
 TOKEN = os.getenv("DISCORD_TOKEN")
@@ -273,113 +272,6 @@ async def setchannel(interaction: discord.Interaction):
     await interaction.response.send_message(
         f"✅ Error alerts will post in {interaction.channel.mention}."
     )
-
-
-@bot.tree.command(name="checkplayvideo", description="Debug: search the live play-by-play feed itself for video fields on a specific play")
-async def checkplayvideo(interaction: discord.Interaction, game_pk: str, search_text: str):
-    await interaction.response.defer()
-    try:
-        feed = await asyncio.to_thread(mlb_api.get_live_feed, int(game_pk))
-    except Exception as e:
-        await interaction.followup.send(f"Couldn't fetch live feed for game {game_pk}: {e}")
-        return
-
-    plays = (((feed.get("liveData") or {}).get("plays") or {}).get("allPlays")) or []
-    matches = [p for p in plays if search_text.lower() in (p.get("result", {}).get("description") or "").lower()]
-
-    if not matches:
-        await interaction.followup.send(f"No play found matching '{search_text}' in game {game_pk}.")
-        return
-
-    play = matches[0]
-
-    def find_video_keys(obj, path=""):
-        """Recursively search for any key containing 'video', 'media', 'guid', or 'content'."""
-        found = []
-        if isinstance(obj, dict):
-            for k, v in obj.items():
-                new_path = f"{path}.{k}" if path else k
-                if any(term in k.lower() for term in ["video", "media", "guid", "content", "highlight"]):
-                    found.append(f"{new_path} = {str(v)[:200]}")
-                found.extend(find_video_keys(v, new_path))
-        elif isinstance(obj, list):
-            for i, item in enumerate(obj[:3]):  # limit to first 3 to keep output manageable
-                found.extend(find_video_keys(item, f"{path}[{i}]"))
-        return found
-
-    video_related = find_video_keys(play)
-    top_keys = list(play.keys())
-
-    msg = (
-        f"**Play found:** {play.get('result', {}).get('description', '')[:200]}\n\n"
-        f"**Top-level play keys:** `{top_keys}`\n\n"
-    )
-    if video_related:
-        msg += "**Video-related fields found:**\n" + "\n".join(f"`{v}`" for v in video_related[:10])
-    else:
-        msg += "**No video/media/guid/content fields found anywhere in this play's data.**"
-
-    await interaction.followup.send(msg[:2000])
-
-
-@bot.tree.command(name="checkvideo", description="Debug: check what MLB's content API returns for a specific game")
-async def checkvideo(interaction: discord.Interaction, game_pk: str):
-    await interaction.response.defer()
-    try:
-        content = await asyncio.to_thread(mlb_api.get_game_content, int(game_pk))
-    except Exception as e:
-        await interaction.followup.send(f"Couldn't fetch content for game {game_pk}: {e}")
-        return
-
-    top_keys = list(content.keys())
-    highlights_val = content.get("highlights")
-    items_count = len((((content.get("highlights") or {}).get("highlights") or {}).get("items")) or [])
-
-    msg = (
-        f"**Game {game_pk} content diagnostic**\n\n"
-        f"Top-level keys: `{top_keys}`\n\n"
-        f"'highlights' key type: `{type(highlights_val).__name__}`\n"
-        f"Items found via highlights.live.items: **{items_count}**\n\n"
-    )
-    if highlights_val:
-        preview = str(highlights_val)[:1500]
-        msg += f"Preview:\n```{preview}```"
-    else:
-        msg += "'highlights' key is empty or missing entirely."
-
-    await interaction.followup.send(msg[:2000])
-
-
-@bot.tree.command(name="checksavant", description="Debug: search Baseball Savant for video clips for a player on a date")
-async def checksavant(interaction: discord.Interaction, player_id: str, game_date: str):
-    await interaction.response.defer()
-    try:
-        html = await asyncio.to_thread(savant_video.search_savant_player_date, int(player_id), game_date)
-    except Exception as e:
-        await interaction.followup.send(f"Savant search failed: {e}")
-        return
-
-    urls = [f"{savant_video.SAVANT_BASE}{link}" for link in savant_video.extract_sporty_links(html)]
-    sporty_mentions = html.lower().count("sporty")
-    html_length = len(html)
-
-    msg = (
-        f"**Savant diagnostic for player {player_id} on {game_date}:**\n\n"
-        f"Raw HTML length: {html_length} characters\n"
-        f"Occurrences of 'sporty' anywhere in the page: {sporty_mentions}\n"
-        f"Links matching our exact pattern: {len(urls)}\n\n"
-    )
-    if urls:
-        msg += "\n".join(urls[:5])
-    elif sporty_mentions > 0:
-        # word appears but our specific pattern didn't match -- URL format likely changed
-        idx = html.lower().find("sporty")
-        snippet = html[max(0, idx - 100):idx + 200]
-        msg += f"'sporty' found in page but pattern didn't match. Snippet:\n```{snippet}```"
-    else:
-        msg += "No mention of 'sporty' anywhere -- page likely renders results via JavaScript, which a simple fetch can't see."
-
-    await interaction.followup.send(msg[:2000])
 
 
 @bot.tree.command(name="lasterror", description="Show the most recent error from today's games")
