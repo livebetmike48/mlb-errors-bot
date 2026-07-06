@@ -354,19 +354,31 @@ async def checkvideo(interaction: discord.Interaction, game_pk: str):
 async def checksavant(interaction: discord.Interaction, player_id: str, game_date: str):
     await interaction.response.defer()
     try:
-        urls = await asyncio.to_thread(savant_video.get_video_urls_for_player_date, int(player_id), game_date)
+        html = await asyncio.to_thread(savant_video.search_savant_player_date, int(player_id), game_date)
     except Exception as e:
         await interaction.followup.send(f"Savant search failed: {e}")
         return
 
-    if not urls:
-        await interaction.followup.send(
-            f"No /sporty-videos links found for player {player_id} on {game_date}. "
-            f"Either no clips exist, or Savant's page structure has changed."
-        )
-        return
+    urls = [f"{savant_video.SAVANT_BASE}{link}" for link in savant_video.extract_sporty_links(html)]
+    sporty_mentions = html.lower().count("sporty")
+    html_length = len(html)
 
-    msg = f"**Found {len(urls)} clip link(s) for player {player_id} on {game_date}:**\n\n" + "\n".join(urls[:10])
+    msg = (
+        f"**Savant diagnostic for player {player_id} on {game_date}:**\n\n"
+        f"Raw HTML length: {html_length} characters\n"
+        f"Occurrences of 'sporty' anywhere in the page: {sporty_mentions}\n"
+        f"Links matching our exact pattern: {len(urls)}\n\n"
+    )
+    if urls:
+        msg += "\n".join(urls[:5])
+    elif sporty_mentions > 0:
+        # word appears but our specific pattern didn't match -- URL format likely changed
+        idx = html.lower().find("sporty")
+        snippet = html[max(0, idx - 100):idx + 200]
+        msg += f"'sporty' found in page but pattern didn't match. Snippet:\n```{snippet}```"
+    else:
+        msg += "No mention of 'sporty' anywhere -- page likely renders results via JavaScript, which a simple fetch can't see."
+
     await interaction.followup.send(msg[:2000])
 
 
