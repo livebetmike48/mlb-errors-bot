@@ -142,7 +142,7 @@ async def poll_games():
                 if event["type"] == "error":
                     storage.add_pending_video_lookup(
                         game["game_pk"], event["play_id"], sent_message.id, channel.id,
-                        event["description"], event.get("end_time"),
+                        event["description"], event.get("end_time"), event.get("batter"),
                     )
             except Exception as e:
                 log.error("Failed to send alert for game %s: %s", game["game_pk"], e)
@@ -189,7 +189,7 @@ async def poll_video_followups():
         try:
             content = mlb_api.get_game_content(row["game_pk"])
             items_count = len((((content.get("highlights") or {}).get("highlights") or {}).get("items")) or [])
-            match = mlb_api.find_highlight_for_play(content, row["description"], row["play_end_time"])
+            match = mlb_api.find_highlight_for_play(content, row["description"], row["play_end_time"], row.get("batter"))
             log.info(
                 "Video lookup game %s play %s: %d highlight items available, match=%s",
                 row["game_pk"], row["play_id"], items_count, bool(match),
@@ -222,9 +222,12 @@ async def poll_video_followups():
 
         try:
             message = await channel.fetch_message(row["message_id"])
-            embed = message.embeds[0]
-            embed.add_field(name="📹 Highlight", value=f"[Watch clip]({match['video_url']})", inline=False)
-            await message.edit(embed=embed)
+            # Sending the raw URL as its OWN plain message (not inside the
+            # embed as a markdown link) is what makes Discord auto-render it
+            # as an inline playable video -- a link buried in an embed field
+            # never gets that treatment, which is why it showed as plain
+            # clickable text before instead of a real video player.
+            await channel.send(match["video_url"], reference=message)
             log.info("Attached video to message %s (game %s)", row["message_id"], row["game_pk"])
         except Exception as e:
             log.error(
