@@ -49,10 +49,19 @@ def init_db():
                 channel_id INTEGER,
                 description TEXT,
                 play_end_time TEXT,
+                batter TEXT,
                 attempts INTEGER DEFAULT 0,
                 created_at TEXT DEFAULT CURRENT_TIMESTAMP
             )
         """)
+
+        # Migration: the batter column was added later -- existing deployed
+        # databases won't have it yet, since CREATE TABLE IF NOT EXISTS is a
+        # no-op on a table that already exists.
+        try:
+            c.execute("ALTER TABLE pending_video_lookups ADD COLUMN batter TEXT")
+        except Exception:
+            pass  # column already exists
 
 
 def already_alerted(game_pk: int, play_id, event_type: str) -> bool:
@@ -116,13 +125,13 @@ def get_config(key: str):
 
 
 def add_pending_video_lookup(game_pk: int, play_id, message_id: int, channel_id: int,
-                              description: str, play_end_time):
+                              description: str, play_end_time, batter: str = None):
     with _conn() as c:
         c.execute("""
             INSERT INTO pending_video_lookups
-            (game_pk, play_id, message_id, channel_id, description, play_end_time)
-            VALUES (?,?,?,?,?,?)
-        """, (game_pk, play_id, message_id, channel_id, description, play_end_time))
+            (game_pk, play_id, message_id, channel_id, description, play_end_time, batter)
+            VALUES (?,?,?,?,?,?,?)
+        """, (game_pk, play_id, message_id, channel_id, description, play_end_time, batter))
 
 
 def get_pending_video_lookups():
