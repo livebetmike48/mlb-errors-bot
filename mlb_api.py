@@ -175,19 +175,19 @@ def get_game_content(game_pk: int) -> dict:
 
 
 def find_highlight_for_play(content_json: dict, play_description: str, play_end_time: str | None,
-                             window_minutes: int = 6) -> dict | None:
+                             batter_name: str | None = None, window_minutes: int = 6) -> dict | None:
     """
     Best-effort match of a highlight clip to a specific play.
 
-    IMPORTANT CAVEAT: MLB's content API doesn't cleanly expose a documented
-    "this clip belongs to atBatIndex N" field in the public docs, so this
-    uses a heuristic instead: it looks for clips published close in time to
-    the play, whose headline/blurb text overlaps with words from the play's
-    description (player names, "error", etc). This works well in practice
-    for distinctive plays but isn't guaranteed. I couldn't verify this
-    against a live game from this sandbox -- if matches come back wrong or
-    missing, send me a game_pk while a real error highlight is up and I can
-    tune the matching logic against real content-endpoint data.
+    IMPORTANT: MLB's content API doesn't cleanly expose a documented "this
+    clip belongs to atBatIndex N" field, so this uses a heuristic -- but the
+    batter's name is now a REQUIRED part of that match, not just a
+    contributing factor to generic word overlap. Generic overlap alone
+    (shared words like "error", "shortstop", team names) was matching
+    completely unrelated plays in the same game, since those words appear
+    in many different clips' headlines. Requiring the specific batter's
+    name to actually appear in the clip's text is a much more reliable
+    signal that this is really the right play.
     """
     items = ((content_json.get("highlights") or {}).get("highlights") or {}).get("items") or []
     if not items:
@@ -200,11 +200,20 @@ def find_highlight_for_play(content_json: dict, play_description: str, play_end_
         except Exception:
             play_dt = None
 
+    batter_last_name = None
+    if batter_name:
+        batter_last_name = batter_name.strip().split()[-1].lower()
+
     desc_words = {w.strip(".,").lower() for w in play_description.split() if len(w) > 3}
 
     candidates = []
     for item in items:
         text = f"{item.get('headline', '')} {item.get('blurb', '')}".lower()
+
+        # Batter's last name MUST appear -- this is the required gate, not optional
+        if batter_last_name and batter_last_name not in text:
+            continue
+
         overlap = sum(1 for w in desc_words if w in text)
         if overlap < 2:
             continue
