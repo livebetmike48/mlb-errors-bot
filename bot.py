@@ -277,39 +277,6 @@ async def setchannel(interaction: discord.Interaction):
     )
 
 
-@bot.tree.command(name="checkfilmroom", description="Debug: test Film Room video search for a player on a date")
-async def checkfilmroom(interaction: discord.Interaction, player_name: str, game_date: str):
-    await interaction.response.defer()
-    try:
-        from mlb_videos import MLBVideoClient
-    except ImportError as e:
-        await interaction.followup.send(f"mlb_videos package isn't installed correctly: {e}")
-        return
-
-    try:
-        def _search():
-            client = MLBVideoClient(project_title="discord_test", project_path="/tmp/filmroom_test")
-            client.get_statcast_df(statcast_params={
-                "start_date": game_date,
-                "end_date": game_date,
-                "players_lookup": [player_name],
-            })
-            if client.df is None or len(client.df) == 0:
-                return "no_statcast_rows", None
-            results = client._get_filmroom_videos(params={"download": False, "feed": "Best"})
-            return "ok", results
-
-        status, results = await asyncio.to_thread(_search)
-
-        if status == "no_statcast_rows":
-            await interaction.followup.send(f"No Statcast rows found for '{player_name}' on {game_date}.")
-            return
-
-        await interaction.followup.send(f"Film Room search completed. Result:\n```{str(results)[:1500]}```")
-    except Exception as e:
-        await interaction.followup.send(f"Film Room search failed: {type(e).__name__}: {e}"[:2000])
-
-
 @bot.tree.command(name="lasterror", description="Show the most recent error from today's games")
 async def lasterror(interaction: discord.Interaction):
     await interaction.response.defer()
