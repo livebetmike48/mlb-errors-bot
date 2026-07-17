@@ -1,8 +1,10 @@
 import os
+import re
 import logging
 import asyncio
 from datetime import datetime, timedelta, timezone
 
+import requests
 import discord
 from discord import app_commands
 from discord.ext import commands, tasks
@@ -15,13 +17,16 @@ load_dotenv()
 TOKEN = os.getenv("DISCORD_TOKEN")
 POLL_SECONDS = int(os.getenv("POLL_SECONDS", "30"))
 VIDEO_POLL_SECONDS = int(os.getenv("VIDEO_POLL_SECONDS", "60"))
-VIDEO_MAX_ATTEMPTS = int(os.getenv("VIDEO_MAX_ATTEMPTS", "6"))  # ~6 min window at 60s poll
+VIDEO_MAX_ATTEMPTS = int(os.getenv("VIDEO_MAX_ATTEMPTS", "10"))  # ~10 min window at 60s poll
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger("errors_bot")
 
 intents = discord.Intents.default()
 bot = commands.Bot(command_prefix="!", intents=intents)
+
+SAVANT_CLIP_PAGE = "https://baseballsavant.mlb.com/sporty-videos?playId={play_id}"
+UUID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", re.I)
 
 
 def et_date_str(offset_days: int = 0) -> str:
@@ -86,7 +91,6 @@ def build_embed(game: dict, event: dict) -> discord.Embed:
 
     embed.set_footer(text="MLB Error Bot • statsapi.mlb.com")
 
-    # Timestamp shown by Discord next to the footer, matching the play time when known
     if event.get("end_time"):
         try:
             embed.timestamp = datetime.fromisoformat(event["end_time"].replace("Z", "+00:00"))
@@ -96,6 +100,50 @@ def build_embed(game: dict, event: dict) -> discord.Embed:
         embed.timestamp = datetime.now(timezone.utc)
 
     return embed
+
+
+# ---------------- Savant per-play clips ----------------
+# Every pitch/play has a Statcast playId; Savant serves that play's
+# broadcast clip at sporty-videos?playId=... -- ALL plays, not just the
+# hand-picked editorial highlights the old lookup searched. The page gets
+# its video ~1-5 minutes after the play; Discord unfurls it into an
+# inline player when the URL is posted as a plain message.
+
+
+def _resolve_play_uuid(game_pk: int, play_id, description: str) -> str | None:
+    """The stored play_id may already be the Statcast UUID -- or a
+    synthetic key from extract_events. If it isn't UUID-shaped, refetch
+    the live feed and find the play by description to get the real one."""
+    if play_id and UUID_RE.match(str(play_id)):
+        return str(play_id)
+    try:
+        feed = mlb_api.get_live_feed(game_pk)
+    except Exception as e:
+        log.error("UUID resolve: feed fetch failed for %s: %s", game_pk, e)
+        return None
+    want = (description or "").strip().lower()
+    for play in (((feed.get("liveData") or {}).get("plays") or {}).get("allPlays") or []):
+        desc = (((play.get("result") or {}).get("description")) or "").strip().lower()
+        if want and desc == want:
+            for pe in reversed(play.get("playEvents") or []):
+                pid = pe.get("playId")
+                if pid and UUID_RE.match(str(pid)):
+                    return str(pid)
+    return None
+
+
+def _savant_clip_ready(play_uuid: str) -> str | None:
+    """Returns the shareable clip URL once MLB has processed the play's
+    video; None while it's still cooking. Readiness = the page references
+    the sporty-clips video host."""
+    url = SAVANT_CLIP_PAGE.format(play_id=play_uuid)
+    try:
+        resp = requests.get(url, timeout=15, headers={"User-Agent": "Mozilla/5.0"})
+        if resp.status_code == 200 and "sporty-clips" in resp.text:
+            return url
+    except Exception as e:
+        log.warning("Savant clip check failed for %s: %s", play_uuid, e)
+    return None
 
 
 @tasks.loop(seconds=POLL_SECONDS)
@@ -143,7 +191,11 @@ async def poll_games():
                 game["game_pk"], event["play_id"], event["type"],
             )
             try:
-                sent_message = await channel.send(embed=build_embed(game, event))
+                sent_message = await channel.send(
+                    embed=build_embed(game, event),
+                    nonce=f"err-{game['game_pk']}-{str(event['play_id'])[:12]}"[:25],
+                    enforce_nonce=True,
+                )
                 log.info("Alerted %s in game %s", event["type"], game["game_pk"])
 
                 # Only errors get a video-clip follow-up for now.
@@ -159,8 +211,7 @@ async def poll_games():
 async def _give_up_on_video(row: dict):
     """Instead of silently doing nothing when no clip is ever found, post
     an honest note -- e.g. if it's a national broadcast, MLB.tv is dark for
-    that game and clips through this pipeline generally aren't available,
-    same distinction a similar bot in the community already makes."""
+    that game and clips through this pipeline generally aren't available."""
     channel = bot.get_channel(row["channel_id"])
     if channel is None:
         return
@@ -194,32 +245,26 @@ async def poll_video_followups():
             storage.delete_pending_video_lookup(row["id"])
             continue
 
+        # 1) Resolve the Statcast play UUID (may already be stored)
         try:
-            content = mlb_api.get_game_content(row["game_pk"])
-            items_count = len((((content.get("highlights") or {}).get("highlights") or {}).get("items")) or [])
-            match = mlb_api.find_highlight_for_play(content, row["description"], row["play_end_time"], row.get("batter"))
-            log.info(
-                "Video lookup game %s play %s: %d highlight items available, match=%s",
-                row["game_pk"], row["play_id"], items_count, bool(match),
+            play_uuid = await asyncio.to_thread(
+                _resolve_play_uuid, row["game_pk"], row["play_id"], row["description"]
             )
-            if items_count == 0 and row["attempts"] == 0:
-                # Diagnostic only, fires once per play on the first attempt --
-                # this tells us the REAL shape of the response instead of
-                # continuing to guess at the JSON path. Once we see this in
-                # the logs we can fix the parsing with certainty.
-                top_keys = list(content.keys())
-                highlights_val = content.get("highlights")
-                log.info(
-                    "DIAGNOSTIC game %s: top-level content keys=%s | 'highlights' key type=%s value_preview=%s",
-                    row["game_pk"], top_keys, type(highlights_val).__name__,
-                    str(highlights_val)[:500] if highlights_val else "None/empty",
-                )
         except Exception as e:
-            log.error("Video lookup failed for game %s: %s", row["game_pk"], e)
+            log.error("UUID resolution failed for game %s: %s", row["game_pk"], e)
+            storage.increment_video_attempts(row["id"])
+            continue
+        if not play_uuid:
+            log.info("No play UUID yet for game %s play %s (attempt %d)",
+                     row["game_pk"], row["play_id"], row["attempts"] + 1)
             storage.increment_video_attempts(row["id"])
             continue
 
-        if not match:
+        # 2) Is the Savant clip processed yet?
+        clip_url = await asyncio.to_thread(_savant_clip_ready, play_uuid)
+        if not clip_url:
+            log.info("Clip not ready for game %s play %s (attempt %d)",
+                     row["game_pk"], play_uuid, row["attempts"] + 1)
             storage.increment_video_attempts(row["id"])
             continue
 
@@ -230,13 +275,10 @@ async def poll_video_followups():
 
         try:
             message = await channel.fetch_message(row["message_id"])
-            # Sending the raw URL as its OWN plain message (not inside the
-            # embed as a markdown link) is what makes Discord auto-render it
-            # as an inline playable video -- a link buried in an embed field
-            # never gets that treatment, which is why it showed as plain
-            # clickable text before instead of a real video player.
-            await channel.send(match["video_url"], reference=message)
-            log.info("Attached video to message %s (game %s)", row["message_id"], row["game_pk"])
+            # Raw URL as its OWN plain message -> Discord unfurls it into an
+            # inline video player (links buried in embed fields never do).
+            await channel.send(clip_url, reference=message)
+            log.info("Attached Savant clip to message %s (game %s)", row["message_id"], row["game_pk"])
         except Exception as e:
             log.error(
                 "Failed to attach video for game %s (channel_id=%s, message_id=%s): %s",
@@ -295,7 +337,6 @@ async def lasterror(interaction: discord.Interaction):
         await interaction.followup.send(f"Couldn't reach the MLB API right now: {e}")
         return
 
-    # Check games that have started (Live or Final) -- skip ones that haven't begun yet
     checkable = [g for g in games if g["abstract_state"] in ("Live", "Final")]
 
     best_game = None
