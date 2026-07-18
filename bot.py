@@ -124,10 +124,28 @@ def build_embed(game: dict, event: dict) -> discord.Embed:
 # inline player when the URL is posted as a plain message.
 
 
-def _resolve_play_uuid(game_pk: int, play_id, description: str) -> str | None:
+def _last_play_uuid(play: dict) -> str | None:
+    for pe in reversed(play.get("playEvents") or []):
+        pid = pe.get("playId")
+        if pid and UUID_RE.match(str(pid)):
+            return str(pid)
+    return None
+
+
+def _resolve_play_uuid(game_pk: int, play_id, description: str,
+                       end_time: str | None = None) -> str | None:
     """The stored play_id may already be the Statcast UUID -- or a
     synthetic key from extract_events. If it isn't UUID-shaped, refetch
-    the live feed and find the play by description to get the real one."""
+    the live feed and find the play to get the real one.
+
+    Matching order (July 18 fix -- clips were being missed):
+      1. about.endTime -- stable play key, survives description edits
+      2. exact description
+      3. unique first-sentence prefix -- official scorers AMEND play
+         descriptions after the fact (seen live: dedup logging showed
+         by_content=False on an already-alerted play), which made the
+         old exact-only match fail all 10 attempts while the clip sat
+         ready on Savant the whole time."""
     if play_id and UUID_RE.match(str(play_id)):
         return str(play_id)
     try:
@@ -135,14 +153,47 @@ def _resolve_play_uuid(game_pk: int, play_id, description: str) -> str | None:
     except Exception as e:
         log.error("UUID resolve: feed fetch failed for %s: %s", game_pk, e)
         return None
+    plays = (((feed.get("liveData") or {}).get("plays") or {}).get("allPlays")) or []
+
+    # 1) endTime: same-source stable identifier
+    if end_time:
+        for play in plays:
+            if ((play.get("about") or {}).get("endTime")) == end_time:
+                uuid = _last_play_uuid(play)
+                if uuid:
+                    log.info("Resolved play UUID via endTime for game %s", game_pk)
+                    return uuid
+
     want = (description or "").strip().lower()
-    for play in (((feed.get("liveData") or {}).get("plays") or {}).get("allPlays") or []):
+    if not want:
+        return None
+
+    # 2) exact description
+    for play in plays:
         desc = (((play.get("result") or {}).get("description")) or "").strip().lower()
-        if want and desc == want:
-            for pe in reversed(play.get("playEvents") or []):
-                pid = pe.get("playId")
-                if pid and UUID_RE.match(str(pid)):
-                    return str(pid)
+        if desc == want:
+            uuid = _last_play_uuid(play)
+            if uuid:
+                log.info("Resolved play UUID via exact description for game %s", game_pk)
+                return uuid
+
+    # 3) first-sentence prefix, only if it identifies exactly ONE play
+    first_sentence = want.split(".")[0].strip()
+    if len(first_sentence) >= 20:
+        matches = []
+        for play in plays:
+            desc = (((play.get("result") or {}).get("description")) or "").strip().lower()
+            if desc.startswith(first_sentence):
+                matches.append(play)
+        if len(matches) == 1:
+            uuid = _last_play_uuid(matches[0])
+            if uuid:
+                log.info("Resolved play UUID via first-sentence prefix for game %s "
+                         "(description was amended by scorer)", game_pk)
+                return uuid
+        elif len(matches) > 1:
+            log.warning("Prefix matched %d plays for game %s -- refusing ambiguous pick",
+                        len(matches), game_pk)
     return None
 
 
@@ -271,6 +322,12 @@ async def poll_games():
                     log.error("Failed to queue video lookup for game %s: %s", game["game_pk"], e)
 
 
+# Rows where the UUID resolved at least once but the clip never processed;
+# lets the give-up note distinguish "couldn't identify the play" (resolver
+# problem) from "clip never appeared" (broadcast/processing problem).
+_uuid_resolved_rows: set = set()
+
+
 async def _give_up_on_video(row: dict):
     """Instead of silently doing nothing when no clip is ever found, post
     an honest note -- e.g. if it's a national broadcast, MLB.tv is dark for
@@ -290,10 +347,14 @@ async def _give_up_on_video(row: dict):
         log.error("Failed to check national broadcast status for game %s: %s", row["game_pk"], e)
         is_national = False
 
-    note = (
-        "*(no clip — national TV exclusive; dark for MLB.tv)*" if is_national
-        else "*(no clip found for this play)*"
-    )
+    had_uuid = row["id"] in _uuid_resolved_rows
+    _uuid_resolved_rows.discard(row["id"])
+    if is_national:
+        note = "*(no clip — national TV exclusive; dark for MLB.tv)*"
+    elif not had_uuid:
+        note = "*(no clip — couldn't match this play in the live feed, likely a scorer amendment)*"
+    else:
+        note = "*(no clip found for this play)*"
     try:
         await channel.send(note, reference=message)
     except Exception as e:
@@ -311,7 +372,8 @@ async def poll_video_followups():
         # 1) Resolve the Statcast play UUID (may already be stored)
         try:
             play_uuid = await asyncio.to_thread(
-                _resolve_play_uuid, row["game_pk"], row["play_id"], row["description"]
+                _resolve_play_uuid, row["game_pk"], row["play_id"],
+                row["description"], row.get("end_time"),
             )
         except Exception as e:
             log.error("UUID resolution failed for game %s: %s", row["game_pk"], e)
@@ -322,6 +384,7 @@ async def poll_video_followups():
                      row["game_pk"], row["play_id"], row["attempts"] + 1)
             storage.increment_video_attempts(row["id"])
             continue
+        _uuid_resolved_rows.add(row["id"])
 
         # 2) Is the Savant clip processed yet?
         clip_url = await asyncio.to_thread(_savant_clip_ready, play_uuid)
@@ -342,6 +405,7 @@ async def poll_video_followups():
             # inline video player (links buried in embed fields never do).
             await channel.send(clip_url, reference=message)
             log.info("Attached Savant clip to message %s (game %s)", row["message_id"], row["game_pk"])
+            _uuid_resolved_rows.discard(row["id"])
         except Exception as e:
             log.error(
                 "Failed to attach video for game %s (channel_id=%s, message_id=%s): %s",
