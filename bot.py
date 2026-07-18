@@ -317,6 +317,50 @@ def _savant_clip_ready(play_uuid: str, game_pk: int | None = None,
     except Exception as e:
         log.warning("Film Room check failed for %s: %s", play_uuid, e)
 
+    # Strategy 2b: Film Room SEARCH query (POST) -- a different index than
+    # the direct mediaPlayback lookup; the shape used by the film-room
+    # scraper projects. Direct lookup was observed hitting some plays and
+    # missing others within the same game, so the search index may cover
+    # plays the direct lookup doesn't.
+    try:
+        gql = {
+            "operationName": "Search",
+            "variables": {
+                "queryType": "STRUCTURED",
+                "query": f'PlayId = "{play_uuid}" Order By Timestamp DESC',
+                "limit": 5, "page": 0,
+                "languagePreference": "EN",
+                "contentPreference": "CMS_FIRST",
+            },
+            "query": (
+                "query Search($query: String!, $page: Int, $limit: Int, "
+                "$queryType: QueryType, $contentPreference: ContentPreference, "
+                "$languagePreference: LanguagePreference) { "
+                "search(query: $query, page: $page, limit: $limit, "
+                "queryType: $queryType, contentPreference: $contentPreference, "
+                "languagePreference: $languagePreference) { "
+                "plays { mediaPlayback { slug feeds { type playbacks { name url } } } } } }"
+            ),
+        }
+        resp = requests.post(
+            "https://fastball-gateway.mlb.com/graphql", json=gql, timeout=15,
+            headers={"User-Agent": "Mozilla/5.0", "Accept": "application/json",
+                     "Content-Type": "application/json"},
+        )
+        if resp.status_code == 200 and resp.text:
+            m = ANY_MP4_RE.search(resp.text)
+            if m:
+                log.info("Clip found via Film Room SEARCH for %s", play_uuid)
+                return m.group(0)
+            snippet = resp.text[:200].replace("\n", " ")
+            log.info("Film Room SEARCH diag for %s: status=200 len=%d head=%r",
+                     play_uuid, len(resp.text), snippet)
+        else:
+            log.info("Film Room SEARCH diag for %s: status=%s len=%d",
+                     play_uuid, resp.status_code, len(resp.text or ""))
+    except Exception as e:
+        log.warning("Film Room SEARCH check failed for %s: %s", play_uuid, e)
+
     # Strategy 3: game content highlights (the pre-rework pipeline)
     if game_pk and description:
         try:
