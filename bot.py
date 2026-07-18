@@ -233,32 +233,67 @@ def _resolve_play_uuid(game_pk: int, play_id, description: str,
     return None
 
 
+ANY_MP4_RE = re.compile(r'https://[^"\'\\\s>]+\.mp4')
+FILMROOM_GQL = (
+    "https://fastball-gateway.mlb.com/graphql"
+    '?query={mediaPlayback(ids:["%s"],languagePreference:EN,idType:PLAY_ID)'
+    "{feeds{playbacks{name url}}}}"
+)
+
+
 def _savant_clip_ready(play_uuid: str) -> str | None:
     """Returns a postable clip URL once MLB has processed the play's video;
     None while it's still cooking.
 
-    July 18 rework: extract the DIRECT sporty-clips .mp4 URL from the page
-    HTML (the same mechanism the working open-source Savant scrapers use)
-    and post that, instead of posting the page URL and hoping Discord's
-    unfurler picks the video up. The direct .mp4 always unfurls into an
-    inline player. If the page shows signs of the clip existing but the
-    .mp4 regex doesn't hit (markup change), fall back to the page URL so
-    behavior degrades to exactly what it was before."""
-    url = SAVANT_CLIP_PAGE.format(play_id=play_uuid)
+    July 18 rework #2 (diagnosed live): 16 straight fetches of the
+    sporty-videos page contained neither an .mp4 URL nor even the string
+    'sporty-clips' -- the page evidently renders its video via JavaScript,
+    so raw-HTML scraping can never see it. Strategy now:
+      1. Still try the page HTML (harmless, and if Savant ever
+         server-renders it we get the direct URL for free)
+      2. Query MLB's Film Room GraphQL gateway by the same Statcast play
+         UUID -- JSON over HTTP, no JS needed; this is the route the
+         community video tools use. We regex any .mp4 URL out of the raw
+         response body rather than trusting an exact schema, so minor
+         schema differences can't break extraction.
+    Diagnostics are logged on every miss so the logs always show WHY."""
+    page_url = SAVANT_CLIP_PAGE.format(play_id=play_uuid)
+
+    # Strategy 1: page HTML (works only if server-rendered)
     try:
-        resp = requests.get(url, timeout=15, headers={"User-Agent": "Mozilla/5.0"})
-        if resp.status_code != 200:
-            return None
-        m = SPORTY_CLIP_MP4_RE.search(resp.text)
-        if m:
-            return m.group(0)
-        if "sporty-clips" in resp.text:
-            # Clip exists but URL pattern didn't match -- degrade to the
-            # old behavior (post the page link) rather than miss the clip.
-            log.warning("Clip exists for %s but .mp4 URL not extracted -- posting page URL", play_uuid)
-            return url
+        resp = requests.get(page_url, timeout=15, headers={"User-Agent": "Mozilla/5.0"})
+        if resp.status_code == 200:
+            m = SPORTY_CLIP_MP4_RE.search(resp.text) or ANY_MP4_RE.search(resp.text)
+            if m:
+                log.info("Clip found via Savant page HTML for %s", play_uuid)
+                return m.group(0)
+            log.info("Savant page diag for %s: status=200 len=%d sporty_str=%s video_tag=%s",
+                     play_uuid, len(resp.text),
+                     "sporty-clips" in resp.text, "<video" in resp.text.lower())
+        else:
+            log.info("Savant page diag for %s: status=%s", play_uuid, resp.status_code)
     except Exception as e:
-        log.warning("Savant clip check failed for %s: %s", play_uuid, e)
+        log.warning("Savant page check failed for %s: %s", play_uuid, e)
+
+    # Strategy 2: Film Room GraphQL gateway
+    try:
+        resp = requests.get(
+            FILMROOM_GQL % play_uuid, timeout=15,
+            headers={"User-Agent": "Mozilla/5.0", "Accept": "application/json"},
+        )
+        if resp.status_code == 200 and resp.text:
+            m = ANY_MP4_RE.search(resp.text)
+            if m:
+                log.info("Clip found via Film Room gateway for %s", play_uuid)
+                return m.group(0)
+            log.info("Film Room diag for %s: status=200 len=%d (no .mp4 in body)",
+                     play_uuid, len(resp.text))
+        else:
+            log.info("Film Room diag for %s: status=%s len=%d",
+                     play_uuid, resp.status_code, len(resp.text or ""))
+    except Exception as e:
+        log.warning("Film Room check failed for %s: %s", play_uuid, e)
+
     return None
 
 
