@@ -256,22 +256,20 @@ FILMROOM_GQL = (
 )
 
 
-def _savant_clip_ready(play_uuid: str) -> str | None:
+def _savant_clip_ready(play_uuid: str, game_pk: int | None = None,
+                       description: str | None = None,
+                       end_time: str | None = None,
+                       batter: str | None = None) -> str | None:
     """Returns a postable clip URL once MLB has processed the play's video;
-    None while it's still cooking.
-
-    July 18 rework #2 (diagnosed live): 16 straight fetches of the
-    sporty-videos page contained neither an .mp4 URL nor even the string
-    'sporty-clips' -- the page evidently renders its video via JavaScript,
-    so raw-HTML scraping can never see it. Strategy now:
-      1. Still try the page HTML (harmless, and if Savant ever
-         server-renders it we get the direct URL for free)
-      2. Query MLB's Film Room GraphQL gateway by the same Statcast play
-         UUID -- JSON over HTTP, no JS needed; this is the route the
-         community video tools use. We regex any .mp4 URL out of the raw
-         response body rather than trusting an exact schema, so minor
-         schema differences can't break extraction.
-    Diagnostics are logged on every miss so the logs always show WHY."""
+    None while it's still cooking. Three strategies, tried in order:
+      1. Savant sporty-videos page HTML (works only if server-rendered)
+      2. Film Room GraphQL gateway by play UUID (fast when it has the play,
+         but observed July 18 returning empty for entire games whose clips
+         another source demonstrably had)
+      3. MLB content API game highlights, matched to the play by batter
+         name + description overlap -- the pre-rework pipeline that
+         reliably produced videos before; known response shapes, real .mp4
+         playback URLs, independent of the Film Room index."""
     page_url = SAVANT_CLIP_PAGE.format(play_id=play_uuid)
 
     # Strategy 1: page HTML (works only if server-rendered)
@@ -308,6 +306,19 @@ def _savant_clip_ready(play_uuid: str) -> str | None:
                      play_uuid, resp.status_code, len(resp.text or ""))
     except Exception as e:
         log.warning("Film Room check failed for %s: %s", play_uuid, e)
+
+    # Strategy 3: game content highlights (the pre-rework pipeline)
+    if game_pk and description:
+        try:
+            content = mlb_api.get_game_content(game_pk)
+            hl = mlb_api.find_highlight_for_play(content, description, end_time, batter)
+            if hl and hl.get("video_url"):
+                log.info("Clip found via content-API highlights for game %s (%s)",
+                         game_pk, hl.get("headline"))
+                return hl["video_url"]
+            log.info("Content highlights diag for game %s: no matching highlight yet", game_pk)
+        except Exception as e:
+            log.warning("Content highlights check failed for game %s: %s", game_pk, e)
 
     return None
 
@@ -517,8 +528,11 @@ async def poll_video_followups():
             continue
         _uuid_resolved_rows.add(row["id"])
 
-        # 2) Is the Savant clip processed yet?
-        clip_url = await asyncio.to_thread(_savant_clip_ready, play_uuid)
+        # 2) Is the clip processed yet? (Savant page -> Film Room -> content highlights)
+        clip_url = await asyncio.to_thread(
+            _savant_clip_ready, play_uuid, row["game_pk"],
+            row["description"], row.get("play_end_time"), row.get("batter"),
+        )
         if not clip_url:
             log.info("Clip not ready for game %s play %s (attempt %d)",
                      row["game_pk"], play_uuid, row["attempts"] + 1)
@@ -698,7 +712,10 @@ async def clipcheck(interaction: discord.Interaction):
         )
         return
 
-    clip_url = await asyncio.to_thread(_savant_clip_ready, play_uuid)
+    clip_url = await asyncio.to_thread(
+        _savant_clip_ready, play_uuid, best_game["game_pk"],
+        best_event["description"], best_event.get("end_time"), best_event.get("batter"),
+    )
     if not clip_url:
         await interaction.followup.send(
             f"Play UUID `{play_uuid}` resolved, but no clip is available yet from Film Room/Savant.\n"
