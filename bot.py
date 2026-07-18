@@ -1,6 +1,5 @@
 import os
 import re
-import inspect
 import logging
 import asyncio
 from datetime import datetime, timedelta, timezone
@@ -27,14 +26,18 @@ log = logging.getLogger("errors_bot")
 intents = discord.Intents.default()
 bot = commands.Bot(command_prefix="!", intents=intents)
 
-# ---- enforce_nonce feature detection (July 18 outage armor) ----
-# enforce_nonce was added in discord.py 2.4. On 2.3.x, passing it makes
-# EVERY send raise TypeError -- which silently killed all alerts for 6
-# hours on July 17 (events were marked-before-send, so failures were
-# swallowed forever). Detect support up front; degrade loudly, not darkly.
-SUPPORTS_ENFORCE_NONCE = (
-    "enforce_nonce" in inspect.signature(discord.abc.Messageable.send).parameters
-)
+# ---- nonce dedup detection (July 18 outage armor, corrected) ----
+# LESSON LEARNED: enforce_nonce is a PYCORD (fork) parameter -- it does
+# not exist in discord.py at any version. Passing it made EVERY send
+# raise TypeError, which silently killed all alerts for 6 hours on July
+# 17 (events were marked-before-send, so failures were swallowed).
+# The real discord.py behavior: since v2.5 the library AUTOMATICALLY
+# enforces nonces on message creation ("Enforce and create random nonces
+# when creating messages throughout the library" -- v2.5 changelog), so
+# server-side duplicate protection needs no kwargs at all. We pass our
+# own deterministic nonce so a crash-between-send-and-mark retry gets
+# deduped by Discord too.
+HAS_SERVER_NONCE_DEDUP = discord.version_info >= (2, 5)
 
 SAVANT_CLIP_PAGE = "https://baseballsavant.mlb.com/sporty-videos?playId={play_id}"
 UUID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", re.I)
@@ -158,11 +161,10 @@ def _savant_clip_ready(play_uuid: str) -> str | None:
 
 
 async def _send_alert(channel, embed: discord.Embed, nonce: str) -> discord.Message:
-    """Send with duplicate armor when the library supports it. On 2.3.x
-    the nonce is still sent (harmless) but Discord won't server-side
-    dedupe -- startup logs a loud warning about that mode."""
-    if SUPPORTS_ENFORCE_NONCE:
-        return await channel.send(embed=embed, nonce=nonce, enforce_nonce=True)
+    """Plain send with a deterministic nonce. On discord.py >= 2.5 the
+    library automatically enforces nonces server-side, so duplicate
+    protection comes free -- never pass enforce_nonce, it is a Pycord
+    parameter that does not exist here and raises TypeError."""
     return await channel.send(embed=embed, nonce=nonce)
 
 
@@ -213,15 +215,16 @@ async def poll_games():
 
             nonce = f"err-{game['game_pk']}-{str(event['play_id'])[:12]}"[:25]
 
-            if not SUPPORTS_ENFORCE_NONCE:
-                # Degraded mode (old discord.py): keep the original
-                # mark-BEFORE-send ordering, because without server-side
-                # nonce dedup a mark-after retry could double-post on an
-                # HTTP-retry duplicate (the original July bug).
+            if not HAS_SERVER_NONCE_DEDUP:
+                # Degraded mode (discord.py < 2.5): keep the original
+                # mark-BEFORE-send ordering, because without automatic
+                # server-side nonce dedup a mark-after retry could
+                # double-post on an HTTP-retry duplicate (the original
+                # July bug).
                 storage.mark_alerted(game["game_pk"], event["play_id"], event["type"])
                 storage.mark_alerted_by_content(game["game_pk"], event["description"])
                 log.info(
-                    "Marking alerted BEFORE send (degraded, no enforce_nonce): game=%s play_id=%s type=%s",
+                    "Marking alerted BEFORE send (degraded, discord.py<2.5): game=%s play_id=%s type=%s",
                     game["game_pk"], event["play_id"], event["type"],
                 )
 
@@ -234,7 +237,7 @@ async def poll_games():
                     "Failed to send alert for game %s (attempt %d/%d): %s",
                     game["game_pk"], _send_failures[key], MAX_SEND_FAILURES, e,
                 )
-                if SUPPORTS_ENFORCE_NONCE and _send_failures[key] >= MAX_SEND_FAILURES:
+                if HAS_SERVER_NONCE_DEDUP and _send_failures[key] >= MAX_SEND_FAILURES:
                     # Stop retrying a permanently-broken send, but say so
                     # LOUDLY -- this event will never post.
                     storage.mark_alerted(game["game_pk"], event["play_id"], event["type"])
@@ -251,7 +254,7 @@ async def poll_games():
             # enforce_nonce dedup covers the gap if we crash between send
             # and mark: the re-send next poll reuses the same nonce and
             # gets deduped server-side.
-            if SUPPORTS_ENFORCE_NONCE:
+            if HAS_SERVER_NONCE_DEDUP:
                 storage.mark_alerted(game["game_pk"], event["play_id"], event["type"])
                 storage.mark_alerted_by_content(game["game_pk"], event["description"])
             _send_failures.pop((game["game_pk"], str(event["play_id"]), event["type"]), None)
@@ -371,12 +374,15 @@ async def on_ready():
         log.info("Synced %d slash commands", len(synced))
     except Exception as e:
         log.error("Slash command sync failed: %s", e)
-    if SUPPORTS_ENFORCE_NONCE:
-        log.info("discord.py %s: enforce_nonce ACTIVE (duplicate armor on, mark-after-send)", discord.__version__)
+    if HAS_SERVER_NONCE_DEDUP:
+        log.info(
+            "discord.py %s: automatic server-side nonce dedup ACTIVE (mark-after-send, failed sends retry)",
+            discord.__version__,
+        )
     else:
         log.warning(
-            "discord.py %s LACKS enforce_nonce -- running DEGRADED (no server-side duplicate "
-            "armor, mark-before-send). Pin discord.py>=2.4.0 in requirements.txt and redeploy.",
+            "discord.py %s is older than 2.5 -- running DEGRADED (no automatic nonce dedup, "
+            "mark-before-send). Pin discord.py>=2.5.0 in requirements.txt and redeploy.",
             discord.__version__,
         )
     if not poll_games.is_running():
