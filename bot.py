@@ -130,7 +130,22 @@ def build_embed(game: dict, event: dict) -> discord.Embed:
 
 
 def _last_play_uuid(play: dict) -> str | None:
-    for pe in reversed(play.get("playEvents") or []):
+    """Statcast playId for the play's video. IMPORTANT: prefer the last
+    PITCH event -- plays can end with trailing non-pitch events (pickoff
+    throws, stepoffs, runner actions) that carry their own playIds with NO
+    video attached. Resolving to one of those made Film Room correctly
+    return an empty result forever while the real clip existed (diagnosed
+    live July 18: 29-byte empty mediaPlayback responses on plays whose
+    clips another source had within a minute)."""
+    events = play.get("playEvents") or []
+    # 1) last pitch event with a UUID-shaped playId
+    for pe in reversed(events):
+        if pe.get("isPitch"):
+            pid = pe.get("playId")
+            if pid and UUID_RE.match(str(pid)):
+                return str(pid)
+    # 2) fallback: last event of any kind with a playId
+    for pe in reversed(events):
         pid = pe.get("playId")
         if pid and UUID_RE.match(str(pid)):
             return str(pid)
