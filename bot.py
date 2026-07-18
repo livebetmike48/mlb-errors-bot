@@ -297,6 +297,34 @@ def _savant_clip_ready(play_uuid: str) -> str | None:
     return None
 
 
+# Discord's bot upload limit on a non-boosted server is 8 MiB. Leave a
+# little headroom for multipart overhead. Boost level 2+ raises the server
+# limit, but 8 MiB is the safe universal floor.
+MAX_UPLOAD_BYTES = int(os.getenv("MAX_UPLOAD_BYTES", str(8 * 1024 * 1024 - 64 * 1024)))
+
+
+def _download_clip(url: str) -> bytes | None:
+    """Downloads the clip, returning its bytes if they fit under Discord's
+    upload limit, else None (caller falls back to posting the URL).
+    Streams with an early bail so an oversized file never fully downloads."""
+    with requests.get(url, timeout=30, stream=True,
+                      headers={"User-Agent": "Mozilla/5.0"}) as resp:
+        resp.raise_for_status()
+        length = resp.headers.get("Content-Length")
+        if length and int(length) > MAX_UPLOAD_BYTES:
+            log.info("Clip too large to upload (%s bytes) -- using URL fallback", length)
+            return None
+        chunks = []
+        total = 0
+        for chunk in resp.iter_content(chunk_size=256 * 1024):
+            total += len(chunk)
+            if total > MAX_UPLOAD_BYTES:
+                log.info("Clip exceeded %d bytes mid-download -- using URL fallback", MAX_UPLOAD_BYTES)
+                return None
+            chunks.append(chunk)
+        return b"".join(chunks)
+
+
 async def _send_alert(channel, embed: discord.Embed, nonce: str) -> discord.Message:
     """Plain send with a deterministic nonce. On discord.py >= 2.5 the
     library automatically enforces nonces server-side, so duplicate
@@ -487,10 +515,29 @@ async def poll_video_followups():
 
         try:
             message = await channel.fetch_message(row["message_id"])
-            # Raw URL as its OWN plain message -> Discord unfurls it into an
-            # inline video player (links buried in embed fields never do).
-            await channel.send(clip_url, reference=message)
-            log.info("Attached Savant clip to message %s (game %s)", row["message_id"], row["game_pk"])
+            posted_as_file = False
+            if clip_url.endswith(".mp4"):
+                # Download and upload as a native attachment -- cleaner in
+                # Discord than a pasted link. Falls back to the URL if the
+                # file exceeds the upload limit or the download fails.
+                try:
+                    file_bytes = await asyncio.to_thread(_download_clip, clip_url)
+                    if file_bytes is not None:
+                        import io
+                        await channel.send(
+                            file=discord.File(io.BytesIO(file_bytes), filename="error_clip.mp4"),
+                            reference=message,
+                        )
+                        posted_as_file = True
+                except Exception as e:
+                    log.warning("Attachment upload failed for game %s, falling back to URL: %s",
+                                row["game_pk"], e)
+            if not posted_as_file:
+                # Raw URL as its OWN plain message -> Discord unfurls it into
+                # an inline video player (links buried in embeds never do).
+                await channel.send(clip_url, reference=message)
+            log.info("Attached Savant clip to message %s (game %s, as_file=%s)",
+                     row["message_id"], row["game_pk"], posted_as_file)
             _uuid_resolved_rows.discard(row["id"])
         except Exception as e:
             log.error(
