@@ -373,7 +373,7 @@ async def poll_video_followups():
         try:
             play_uuid = await asyncio.to_thread(
                 _resolve_play_uuid, row["game_pk"], row["play_id"],
-                row["description"], row.get("end_time"),
+                row["description"], row.get("play_end_time"),
             )
         except Exception as e:
             log.error("UUID resolution failed for game %s: %s", row["game_pk"], e)
