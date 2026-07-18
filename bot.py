@@ -600,29 +600,10 @@ async def poll_video_followups():
 
         try:
             message = await channel.fetch_message(row["message_id"])
-            posted_as_file = False
-            if clip_url.endswith(".mp4"):
-                # Download and upload as a native attachment -- cleaner in
-                # Discord than a pasted link. Falls back to the URL if the
-                # file exceeds the upload limit or the download fails.
-                try:
-                    file_bytes = await asyncio.to_thread(_download_clip, clip_url)
-                    if file_bytes is not None:
-                        import io
-                        await channel.send(
-                            file=discord.File(io.BytesIO(file_bytes), filename="error_clip.mp4"),
-                            reference=message,
-                        )
-                        posted_as_file = True
-                except Exception as e:
-                    log.warning("Attachment upload failed for game %s, falling back to URL: %s",
-                                row["game_pk"], e)
-            if not posted_as_file:
-                # Raw URL as its OWN plain message -> Discord unfurls it into
-                # an inline video player (links buried in embeds never do).
-                await channel.send(clip_url, reference=message)
-            log.info("Attached Savant clip to message %s (game %s, as_file=%s)",
-                     row["message_id"], row["game_pk"], posted_as_file)
+            # Raw URL as its OWN plain message -> Discord unfurls it into an
+            # inline video player (links buried in embeds never do).
+            await channel.send(clip_url, reference=message)
+            log.info("Attached Savant clip to message %s (game %s)", row["message_id"], row["game_pk"])
             _uuid_resolved_rows.discard(row["id"])
         except Exception as e:
             log.error(
@@ -777,21 +758,7 @@ async def clipcheck(interaction: discord.Interaction):
         )
         return
 
-    posted_as_file = False
-    if clip_url.endswith(".mp4"):
-        try:
-            file_bytes = await asyncio.to_thread(_download_clip, clip_url)
-            if file_bytes is not None:
-                import io
-                await interaction.followup.send(
-                    content=f"```{best_event['description'][:300]}```",
-                    file=discord.File(io.BytesIO(file_bytes), filename="error_clip.mp4"),
-                )
-                posted_as_file = True
-        except Exception as e:
-            log.warning("clipcheck attachment upload failed: %s", e)
-    if not posted_as_file:
-        await interaction.followup.send(f"```{best_event['description'][:300]}```\n{clip_url}")
+    await interaction.followup.send(f"```{best_event['description'][:300]}```\n{clip_url}")
 
 
 if __name__ == "__main__":
