@@ -41,6 +41,11 @@ HAS_SERVER_NONCE_DEDUP = discord.version_info >= (2, 5)
 
 SAVANT_CLIP_PAGE = "https://baseballsavant.mlb.com/sporty-videos?playId={play_id}"
 UUID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", re.I)
+# Direct video-file URL embedded in the sporty-videos page HTML, e.g.
+# https://sporty-clips.mlb.com/XXXX.mp4 -- the same pattern the working
+# open-source Savant scrapers extract. Posting the .mp4 directly gives
+# Discord a file it can always unfurl into an inline player.
+SPORTY_CLIP_MP4_RE = re.compile(r'https://sporty-clips\.mlb\.com/[^"\'\s>]+\.mp4')
 
 
 def et_date_str(offset_days: int = 0) -> str:
@@ -229,13 +234,28 @@ def _resolve_play_uuid(game_pk: int, play_id, description: str,
 
 
 def _savant_clip_ready(play_uuid: str) -> str | None:
-    """Returns the shareable clip URL once MLB has processed the play's
-    video; None while it's still cooking. Readiness = the page references
-    the sporty-clips video host."""
+    """Returns a postable clip URL once MLB has processed the play's video;
+    None while it's still cooking.
+
+    July 18 rework: extract the DIRECT sporty-clips .mp4 URL from the page
+    HTML (the same mechanism the working open-source Savant scrapers use)
+    and post that, instead of posting the page URL and hoping Discord's
+    unfurler picks the video up. The direct .mp4 always unfurls into an
+    inline player. If the page shows signs of the clip existing but the
+    .mp4 regex doesn't hit (markup change), fall back to the page URL so
+    behavior degrades to exactly what it was before."""
     url = SAVANT_CLIP_PAGE.format(play_id=play_uuid)
     try:
         resp = requests.get(url, timeout=15, headers={"User-Agent": "Mozilla/5.0"})
-        if resp.status_code == 200 and "sporty-clips" in resp.text:
+        if resp.status_code != 200:
+            return None
+        m = SPORTY_CLIP_MP4_RE.search(resp.text)
+        if m:
+            return m.group(0)
+        if "sporty-clips" in resp.text:
+            # Clip exists but URL pattern didn't match -- degrade to the
+            # old behavior (post the page link) rather than miss the clip.
+            log.warning("Clip exists for %s but .mp4 URL not extracted -- posting page URL", play_uuid)
             return url
     except Exception as e:
         log.warning("Savant clip check failed for %s: %s", play_uuid, e)
