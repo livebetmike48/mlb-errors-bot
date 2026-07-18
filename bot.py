@@ -425,8 +425,10 @@ async def poll_games():
             _send_failures.pop((game["game_pk"], str(event["play_id"]), event["type"]), None)
             log.info("Alerted %s in game %s", event["type"], game["game_pk"])
 
-            # Only errors get a video-clip follow-up for now.
-            if event["type"] == "error":
+            # Errors AND scorer-ruling-pending plays get a video-clip
+            # follow-up -- for pending rulings, seeing the play helps judge
+            # hit-vs-error before the official scorer decides.
+            if event["type"] in ("error", "ruling_pending"):
                 try:
                     storage.add_pending_video_lookup(
                         game["game_pk"], event["play_id"], sent_message.id, channel.id,
