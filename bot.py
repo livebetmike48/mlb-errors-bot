@@ -654,6 +654,75 @@ async def lasterror(interaction: discord.Interaction):
     await interaction.followup.send(embed=build_embed(best_game, best_event))
 
 
+@bot.tree.command(name="clipcheck", description="Fetch the video clip for the most recent error in today's games")
+async def clipcheck(interaction: discord.Interaction):
+    await interaction.response.defer()
+    date_str = et_date_str(0)
+    try:
+        games = mlb_api.get_live_games(date_str)
+    except Exception as e:
+        await interaction.followup.send(f"Couldn't reach the MLB API right now: {e}")
+        return
+
+    checkable = [g for g in games if g["abstract_state"] in ("Live", "Final")]
+
+    best_game = None
+    best_event = None
+    best_time = None
+    for game in checkable:
+        try:
+            feed = mlb_api.get_live_feed(game["game_pk"])
+            events = mlb_api.extract_events(feed)
+        except Exception:
+            continue
+        for event in events:
+            if event["type"] != "error":
+                continue
+            end_time = event.get("end_time")
+            if end_time and (best_time is None or end_time > best_time):
+                best_time = end_time
+                best_event = event
+                best_game = game
+
+    if not best_event:
+        await interaction.followup.send("No errors found in today's games yet.")
+        return
+
+    play_uuid = await asyncio.to_thread(
+        _resolve_play_uuid, best_game["game_pk"], best_event["play_id"],
+        best_event["description"], best_event.get("end_time"), best_event.get("batter"),
+    )
+    if not play_uuid:
+        await interaction.followup.send(
+            f"Found the error ({best_event['description'][:150]}) but couldn't resolve its Statcast play UUID."
+        )
+        return
+
+    clip_url = await asyncio.to_thread(_savant_clip_ready, play_uuid)
+    if not clip_url:
+        await interaction.followup.send(
+            f"Play UUID `{play_uuid}` resolved, but no clip is available yet from Film Room/Savant.\n"
+            f"```{best_event['description'][:300]}```"
+        )
+        return
+
+    posted_as_file = False
+    if clip_url.endswith(".mp4"):
+        try:
+            file_bytes = await asyncio.to_thread(_download_clip, clip_url)
+            if file_bytes is not None:
+                import io
+                await interaction.followup.send(
+                    content=f"```{best_event['description'][:300]}```",
+                    file=discord.File(io.BytesIO(file_bytes), filename="error_clip.mp4"),
+                )
+                posted_as_file = True
+        except Exception as e:
+            log.warning("clipcheck attachment upload failed: %s", e)
+    if not posted_as_file:
+        await interaction.followup.send(f"```{best_event['description'][:300]}```\n{clip_url}")
+
+
 if __name__ == "__main__":
     if not TOKEN:
         raise SystemExit("Set DISCORD_TOKEN in your .env file (see .env.example).")
