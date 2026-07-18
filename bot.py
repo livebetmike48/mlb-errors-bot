@@ -272,21 +272,31 @@ def _savant_clip_ready(play_uuid: str, game_pk: int | None = None,
          playback URLs, independent of the Film Room index."""
     page_url = SAVANT_CLIP_PAGE.format(play_id=play_uuid)
 
-    # Strategy 1: page HTML (works only if server-rendered)
-    try:
-        resp = requests.get(page_url, timeout=15, headers={"User-Agent": "Mozilla/5.0"})
-        if resp.status_code == 200:
-            m = SPORTY_CLIP_MP4_RE.search(resp.text) or ANY_MP4_RE.search(resp.text)
-            if m:
-                log.info("Clip found via Savant page HTML for %s", play_uuid)
-                return m.group(0)
-            log.info("Savant page diag for %s: status=200 len=%d sporty_str=%s video_tag=%s",
-                     play_uuid, len(resp.text),
-                     "sporty-clips" in resp.text, "<video" in resp.text.lower())
-        else:
-            log.info("Savant page diag for %s: status=%s", play_uuid, resp.status_code)
-    except Exception as e:
-        log.warning("Savant page check failed for %s: %s", play_uuid, e)
+    # Strategies 1a/1b: Savant page HTML, both URL forms. The query-param
+    # form was observed returning an identical 88000-byte JS shell for
+    # every play; the PATH form (/sporty-videos/UUID) is the link shape the
+    # confirmed-working open-source Savant downloader extracts and fetches,
+    # and may be server-rendered with the real video URL.
+    for label, url in (
+        ("path-form", f"https://baseballsavant.mlb.com/sporty-videos/{play_uuid}"),
+        ("query-form", page_url),
+    ):
+        try:
+            resp = requests.get(url, timeout=15, headers={"User-Agent": "Mozilla/5.0"})
+            if resp.status_code == 200:
+                m = SPORTY_CLIP_MP4_RE.search(resp.text) or ANY_MP4_RE.search(resp.text)
+                if m:
+                    log.info("Clip found via Savant page (%s) for %s", label, play_uuid)
+                    return m.group(0)
+                snippet = resp.text[:180].replace("\n", " ")
+                log.info("Savant page diag (%s) for %s: status=200 len=%d sporty_str=%s "
+                         "video_tag=%s head=%r",
+                         label, play_uuid, len(resp.text),
+                         "sporty-clips" in resp.text, "<video" in resp.text.lower(), snippet)
+            else:
+                log.info("Savant page diag (%s) for %s: status=%s", label, play_uuid, resp.status_code)
+        except Exception as e:
+            log.warning("Savant page check (%s) failed for %s: %s", label, play_uuid, e)
 
     # Strategy 2: Film Room GraphQL gateway
     try:
