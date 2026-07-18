@@ -1,5 +1,6 @@
 import os
 import re
+import inspect
 import logging
 import asyncio
 from datetime import datetime, timedelta, timezone
@@ -18,12 +19,22 @@ TOKEN = os.getenv("DISCORD_TOKEN")
 POLL_SECONDS = int(os.getenv("POLL_SECONDS", "30"))
 VIDEO_POLL_SECONDS = int(os.getenv("VIDEO_POLL_SECONDS", "60"))
 VIDEO_MAX_ATTEMPTS = int(os.getenv("VIDEO_MAX_ATTEMPTS", "10"))  # ~10 min window at 60s poll
+MAX_SEND_FAILURES = int(os.getenv("MAX_SEND_FAILURES", "5"))  # retries before giving up on an event
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger("errors_bot")
 
 intents = discord.Intents.default()
 bot = commands.Bot(command_prefix="!", intents=intents)
+
+# ---- enforce_nonce feature detection (July 18 outage armor) ----
+# enforce_nonce was added in discord.py 2.4. On 2.3.x, passing it makes
+# EVERY send raise TypeError -- which silently killed all alerts for 6
+# hours on July 17 (events were marked-before-send, so failures were
+# swallowed forever). Detect support up front; degrade loudly, not darkly.
+SUPPORTS_ENFORCE_NONCE = (
+    "enforce_nonce" in inspect.signature(discord.abc.Messageable.send).parameters
+)
 
 SAVANT_CLIP_PAGE = "https://baseballsavant.mlb.com/sporty-videos?playId={play_id}"
 UUID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", re.I)
@@ -146,6 +157,22 @@ def _savant_clip_ready(play_uuid: str) -> str | None:
     return None
 
 
+async def _send_alert(channel, embed: discord.Embed, nonce: str) -> discord.Message:
+    """Send with duplicate armor when the library supports it. On 2.3.x
+    the nonce is still sent (harmless) but Discord won't server-side
+    dedupe -- startup logs a loud warning about that mode."""
+    if SUPPORTS_ENFORCE_NONCE:
+        return await channel.send(embed=embed, nonce=nonce, enforce_nonce=True)
+    return await channel.send(embed=embed, nonce=nonce)
+
+
+# Per-event send-failure counts, in memory. If a send keeps failing (e.g.
+# missing permissions), give up after MAX_SEND_FAILURES instead of
+# retrying every poll forever. Restart clears it -- acceptable, since a
+# restart is exactly when a stuck event deserves one more shot.
+_send_failures: dict[tuple, int] = {}
+
+
 @tasks.loop(seconds=POLL_SECONDS)
 async def poll_games():
     channel_id = storage.get_config("announce_channel_id")
@@ -184,28 +211,61 @@ async def poll_games():
                 )
                 continue
 
-            storage.mark_alerted(game["game_pk"], event["play_id"], event["type"])
-            storage.mark_alerted_by_content(game["game_pk"], event["description"])
-            log.info(
-                "Marking alerted BEFORE send: game=%s play_id=%s type=%s",
-                game["game_pk"], event["play_id"], event["type"],
-            )
-            try:
-                sent_message = await channel.send(
-                    embed=build_embed(game, event),
-                    nonce=f"err-{game['game_pk']}-{str(event['play_id'])[:12]}"[:25],
-                    enforce_nonce=True,
-                )
-                log.info("Alerted %s in game %s", event["type"], game["game_pk"])
+            nonce = f"err-{game['game_pk']}-{str(event['play_id'])[:12]}"[:25]
 
-                # Only errors get a video-clip follow-up for now.
-                if event["type"] == "error":
+            if not SUPPORTS_ENFORCE_NONCE:
+                # Degraded mode (old discord.py): keep the original
+                # mark-BEFORE-send ordering, because without server-side
+                # nonce dedup a mark-after retry could double-post on an
+                # HTTP-retry duplicate (the original July bug).
+                storage.mark_alerted(game["game_pk"], event["play_id"], event["type"])
+                storage.mark_alerted_by_content(game["game_pk"], event["description"])
+                log.info(
+                    "Marking alerted BEFORE send (degraded, no enforce_nonce): game=%s play_id=%s type=%s",
+                    game["game_pk"], event["play_id"], event["type"],
+                )
+
+            try:
+                sent_message = await _send_alert(channel, build_embed(game, event), nonce)
+            except Exception as e:
+                key = (game["game_pk"], str(event["play_id"]), event["type"])
+                _send_failures[key] = _send_failures.get(key, 0) + 1
+                log.error(
+                    "Failed to send alert for game %s (attempt %d/%d): %s",
+                    game["game_pk"], _send_failures[key], MAX_SEND_FAILURES, e,
+                )
+                if SUPPORTS_ENFORCE_NONCE and _send_failures[key] >= MAX_SEND_FAILURES:
+                    # Stop retrying a permanently-broken send, but say so
+                    # LOUDLY -- this event will never post.
+                    storage.mark_alerted(game["game_pk"], event["play_id"], event["type"])
+                    storage.mark_alerted_by_content(game["game_pk"], event["description"])
+                    log.error(
+                        "GIVING UP on event after %d failed sends: game=%s play_id=%s type=%s",
+                        MAX_SEND_FAILURES, game["game_pk"], event["play_id"], event["type"],
+                    )
+                # Not marked (normal mode, under the cap) -> event retries
+                # next poll. Degraded mode keeps old swallow behavior.
+                continue
+
+            # Send SUCCEEDED -- mark now (normal mode). Discord's
+            # enforce_nonce dedup covers the gap if we crash between send
+            # and mark: the re-send next poll reuses the same nonce and
+            # gets deduped server-side.
+            if SUPPORTS_ENFORCE_NONCE:
+                storage.mark_alerted(game["game_pk"], event["play_id"], event["type"])
+                storage.mark_alerted_by_content(game["game_pk"], event["description"])
+            _send_failures.pop((game["game_pk"], str(event["play_id"]), event["type"]), None)
+            log.info("Alerted %s in game %s", event["type"], game["game_pk"])
+
+            # Only errors get a video-clip follow-up for now.
+            if event["type"] == "error":
+                try:
                     storage.add_pending_video_lookup(
                         game["game_pk"], event["play_id"], sent_message.id, channel.id,
                         event["description"], event.get("end_time"), event.get("batter"),
                     )
-            except Exception as e:
-                log.error("Failed to send alert for game %s: %s", game["game_pk"], e)
+                except Exception as e:
+                    log.error("Failed to queue video lookup for game %s: %s", game["game_pk"], e)
 
 
 async def _give_up_on_video(row: dict):
@@ -311,6 +371,14 @@ async def on_ready():
         log.info("Synced %d slash commands", len(synced))
     except Exception as e:
         log.error("Slash command sync failed: %s", e)
+    if SUPPORTS_ENFORCE_NONCE:
+        log.info("discord.py %s: enforce_nonce ACTIVE (duplicate armor on, mark-after-send)", discord.__version__)
+    else:
+        log.warning(
+            "discord.py %s LACKS enforce_nonce -- running DEGRADED (no server-side duplicate "
+            "armor, mark-before-send). Pin discord.py>=2.4.0 in requirements.txt and redeploy.",
+            discord.__version__,
+        )
     if not poll_games.is_running():
         poll_games.start()
     if not poll_video_followups.is_running():
