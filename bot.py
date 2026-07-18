@@ -133,12 +133,17 @@ def _last_play_uuid(play: dict) -> str | None:
 
 
 def _resolve_play_uuid(game_pk: int, play_id, description: str,
-                       end_time: str | None = None) -> str | None:
-    """The stored play_id may already be the Statcast UUID -- or a
-    synthetic key from extract_events. If it isn't UUID-shaped, refetch
-    the live feed and find the play to get the real one.
+                       end_time: str | None = None,
+                       batter: str | None = None) -> str | None:
+    """The stored play_id may already be the Statcast UUID -- or (per
+    extract_events) the play's atBatIndex. If it isn't UUID-shaped,
+    refetch the live feed and find the play to get the real one.
 
     Matching order (July 18 fix -- clips were being missed):
+      0. atBatIndex direct lookup, VERIFIED by endTime or batter name --
+         the feed can re-issue a play under a new atBatIndex after an
+         internal reprocess (the reason storage has content-hash dedup),
+         so an index hit is only trusted when a second field agrees
       1. about.endTime -- stable play key, survives description edits
       2. exact description
       3. unique first-sentence prefix -- official scorers AMEND play
@@ -154,6 +159,32 @@ def _resolve_play_uuid(game_pk: int, play_id, description: str,
         log.error("UUID resolve: feed fetch failed for %s: %s", game_pk, e)
         return None
     plays = (((feed.get("liveData") or {}).get("plays") or {}).get("allPlays")) or []
+
+    # 0) atBatIndex: direct key from extract_events, trusted only when a
+    #    second field confirms the play wasn't reindexed underneath us
+    try:
+        idx = int(play_id)
+    except (TypeError, ValueError):
+        idx = None
+    if idx is not None:
+        for play in plays:
+            if ((play.get("about") or {}).get("atBatIndex")) != idx:
+                continue
+            confirmed_by = None
+            if end_time and ((play.get("about") or {}).get("endTime")) == end_time:
+                confirmed_by = "endTime"
+            elif batter and (((play.get("matchup") or {}).get("batter") or {}).get("fullName")) == batter:
+                confirmed_by = "batter"
+            if confirmed_by:
+                uuid = _last_play_uuid(play)
+                if uuid:
+                    log.info("Resolved play UUID via atBatIndex (confirmed by %s) for game %s",
+                             confirmed_by, game_pk)
+                    return uuid
+            else:
+                log.warning("atBatIndex %s matched a play but verification failed for game %s "
+                            "(feed reindexed?) -- trying other strategies", idx, game_pk)
+            break
 
     # 1) endTime: same-source stable identifier
     if end_time:
@@ -373,7 +404,7 @@ async def poll_video_followups():
         try:
             play_uuid = await asyncio.to_thread(
                 _resolve_play_uuid, row["game_pk"], row["play_id"],
-                row["description"], row.get("play_end_time"),
+                row["description"], row.get("play_end_time"), row.get("batter"),
             )
         except Exception as e:
             log.error("UUID resolution failed for game %s: %s", row["game_pk"], e)
